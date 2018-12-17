@@ -351,17 +351,9 @@ vn2 as
 				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
 			from
 			(
-				(select ('VND') as country, A.logid, C.parent_key, ctime 
-					from
-						shopee_logistic_vn_db__logistic_log_v2_tab A
-					left join
-						shopee_order_details_db__order_details_tab_extinfo_logistics_info C
-					on A.logid = C.logisticsid
-					where (A.channel_status in ('DELIVERY_PENDING','DOMESTIC_DELIVERED','DOMESTIC_DELIVERING')) and C.channelid in (50017))
-				union
-				(select country,logid,parent_key, ctime 
+				select country,logid,parent_key, ctime 
 					from slsbe
-					where sls_status in ('10','45','49','410','5','9') and channelid = 50017)
+					where sls_status in ('10','45','49','410','5','9') and channelid = 50017
 			)
 			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
 		) A
@@ -390,17 +382,9 @@ vn2 as
 				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
 			from
 			(
-				(select ('VND') as country, A.logid, C.parent_key, ctime 
-					from
-						shopee_logistic_vn_db__logistic_log_v2_tab A
-					left join
-						shopee_order_details_db__order_details_tab_extinfo_logistics_info C
-					on A.logid = C.logisticsid
-					where (A.channel_status in ('DELIVERY_PENDING','DOMESTIC_DELIVERED','DOMESTIC_DELIVERING')) and C.channelid in (50017))
-				union
-				(select country,logid,parent_key, ctime 
+				select country,logid,parent_key, ctime 
 					from slsbe
-					where sls_status in ('10','45','49','410','5','9') and channelid = 50017)
+					where sls_status in ('10','45','49','410','5','9') and channelid = 50017
 			)
 			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
 		) A
@@ -429,17 +413,9 @@ vn2 as
 				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
 			from
 			(
-				(select ('VND') as country, A.logid, C.parent_key, ctime 
-					from
-						shopee_logistic_vn_db__logistic_log_v2_tab A
-					left join
-						shopee_order_details_db__order_details_tab_extinfo_logistics_info C
-					on A.logid = C.logisticsid
-					where (A.channel_status in ('DELIVERY_PENDING','DOMESTIC_DELIVERED','DOMESTIC_DELIVERING')) and C.channelid in (50017))
-				union
-				(select country,logid,parent_key, ctime 
+				select country,logid,parent_key, ctime 
 					from slsbe
-					where sls_status in ('10','45','49','410','5','9') and channelid = 50017)
+					where sls_status in ('10','45','49','410','5','9') and channelid = 50017
 			)
 			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
 		) A
