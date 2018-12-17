@@ -343,31 +343,44 @@ vn1 as
 		group by 1,2,3,4,5
 ),
 /* for VN: delivery timing orders 1 week before based on delivery attempt timing*/ 
+vn2del as
+(
+	Select
+		('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
+	from
+	(
+		select country,logid,parent_key, ctime 
+			from slsbe
+			where sls_status in ('10','45','49','410','5','9') and channelid = 50017
+	)
+	group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
+),
+
+vn2pick as
+(
+	Select
+		B.orderid, min(B.ctime)-3600 as pickup_time	
+	from
+		shopee_order_audit_db__order_audit_v2_tab B
+	left join
+		shopee_order_details_db__order_details_tab_extinfo D
+	on B.orderid = D.parent_key AND B.grass_region = D.grass_region
+	Where B.new_status = 1 AND B.grass_region = 'VN'
+	group by B.orderid
+),
+
+
 vn2 as
 	(
 		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - pickup_time)/60/60/24 as date_difference, NULL as channelid from
-		(
-			Select
-				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
-			from
-			(
-				select country,logid,parent_key, ctime 
-					from slsbe
-					where sls_status in ('10','45','49','410','5','9') and channelid = 50017
-			)
-			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
-		) A
+		vn2del A
 		left join
 		(
 			Select
-				B.orderid, min(B.ctime)-3600 as pickup_time	
+				*
 			from
-				shopee_order_audit_db__order_audit_v2_tab B
-			left join
-				shopee_order_details_db__order_details_tab_extinfo D
-			on B.orderid = D.parent_key AND B.grass_region = D.grass_region
-			Where B.new_status = 1 AND B.grass_region = 'VN'
-			group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 0 and 10
+				vn2pick
+			where hour(from_unixtime(pickup_time)) between 0 and 6 AND date_format(from_unixtime(pickup_time),'E') != 'Sat'
 		) B
 		on
 		A.parent_key = B.orderid
@@ -377,28 +390,14 @@ vn2 as
 		union
 		
 		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - (unix_timestamp(DATE(from_unixtime(pickup_time)))+11*60*60))/60/60/24 as date_difference, NULL as channelid from
-		(
-			Select
-				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
-			from
-			(
-				select country,logid,parent_key, ctime 
-					from slsbe
-					where sls_status in ('10','45','49','410','5','9') and channelid = 50017
-			)
-			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
-		) A
+		vn2del A
 		left join
 		(
 			Select
-				B.orderid, min(B.ctime)-3600 as pickup_time	
+				*
 			from
-				shopee_order_audit_db__order_audit_v2_tab B
-			left join
-				shopee_order_details_db__order_details_tab_extinfo D
-			on B.orderid = D.parent_key AND B.grass_region = D.grass_region
-			Where B.new_status = 1 AND B.grass_region = 'VN'
-			group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 11 and 17
+				vn2pick
+			where hour(from_unixtime(pickup_time)) between 7 and 12 AND date_format(from_unixtime(pickup_time),'E') != 'Sat'
 		) B
 		on
 		A.parent_key = B.orderid
@@ -408,28 +407,66 @@ vn2 as
 		union
 		
 		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - (unix_timestamp(DATE(from_unixtime(pickup_time)))+18*60*60))/60/60/24 as date_difference, NULL as channelid from
-		(
-			Select
-				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
-			from
-			(
-				select country,logid,parent_key, ctime 
-					from slsbe
-					where sls_status in ('10','45','49','410','5','9') and channelid = 50017
-			)
-			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
-		) A
+		vn2del A
 		left join
 		(
 			Select
-				B.orderid, min(B.ctime)-3600 as pickup_time	
+				*
 			from
-				shopee_order_audit_db__order_audit_v2_tab B
-			left join
-				shopee_order_details_db__order_details_tab_extinfo D
-			on B.orderid = D.parent_key AND B.grass_region = D.grass_region
-			Where B.new_status = 1 AND B.grass_region = 'VN'
-			group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 18 and 23
+				vn2pick
+			where hour(from_unixtime(pickup_time)) between 13 and 23 AND date_format(from_unixtime(pickup_time),'E') != 'Sat'
+		) B
+		on
+		A.parent_key = B.orderid
+		WHERE pickup_time IS NOT NULL
+		group by 1,2,3,4,5
+),
+
+vn2Sat as
+	(
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - pickup_time)/60/60/24 as date_difference, NULL as channelid from
+		vn2del A
+		left join
+		(
+			Select
+				*
+			from
+				vn2pick
+			where hour(from_unixtime(pickup_time)) between 0 and 10 AND date_format(from_unixtime(pickup_time),'E') = 'Sat'
+		) B
+		on
+		A.parent_key = B.orderid
+		WHERE pickup_time IS NOT NULL
+		group by 1,2,3,4,5
+
+		union
+		
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - (unix_timestamp(DATE(from_unixtime(pickup_time)))+11*60*60))/60/60/24 as date_difference, NULL as channelid from
+		vn2del A
+		left join
+		(
+			Select
+				*
+			from
+				vn2pick
+			where hour(from_unixtime(pickup_time)) between 11 and 17 AND date_format(from_unixtime(pickup_time),'E') = 'Sat'
+		) B
+		on
+		A.parent_key = B.orderid
+		WHERE pickup_time IS NOT NULL
+		group by 1,2,3,4,5
+
+		union
+		
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - (unix_timestamp(DATE(from_unixtime(pickup_time)))+18*60*60))/60/60/24 as date_difference, NULL as channelid from
+		vn2del A
+		left join
+		(
+			Select
+				*
+			from
+				vn2pick
+			where hour(from_unixtime(pickup_time)) between 18 and 23 AND date_format(from_unixtime(pickup_time),'E') = 'Sat'
 		) B
 		on
 		A.parent_key = B.orderid
