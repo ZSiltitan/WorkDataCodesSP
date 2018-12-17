@@ -115,12 +115,12 @@ id1 as
 				Select
 					B.orderid, min(B.ctime)-3600 as pickup_time	
 				from
-					shopee_order_audit_db__order_audit_v2_tab B
+					shopee_logistics_audit_db__logistics_audit_tab B
 				left join
 					shopee_order_details_db__order_details_tab_extinfo D
 				on B.orderid = D.parent_key AND B.grass_region = D.grass_region
-				Where B.new_status = 1 AND B.grass_region = 'ID'
-				group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 0 and 14
+				Where B.new_status = 2 AND B.grass_region = 'ID'
+				group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 0 and 16 AND minute(from_unixtime(min(B.ctime)-3600)) <= 30 
 			) B
 			on
 			A.parent_key = B.orderid
@@ -151,12 +151,12 @@ id1 as
 				Select
 					B.orderid, min(B.ctime)-3600 as pickup_time	
 				from
-					shopee_order_audit_db__order_audit_v2_tab B
+					shopee_logistics_audit_db__logistics_audit_tab B
 				left join
 					shopee_order_details_db__order_details_tab_extinfo D
 				on B.orderid = D.parent_key AND B.grass_region = D.grass_region
 				Where B.new_status = 2 AND B.grass_region = 'ID'
-				group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 15 and 23
+				group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 16 and 23 AND minute(from_unixtime(min(B.ctime)-3600)) > 30 
 			) B
 			on
 			A.parent_key = B.orderid
