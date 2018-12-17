@@ -1,0 +1,767 @@
+with T1 as
+	(
+		Select
+			A.orderid, A.currency, A.shipping_method, A.shipping_traceno, D.channelid, B.city as buyer_city, B.state as buyer_state, C.city as seller_city, C.state as seller_state, D.logisticsid, E.username as seller_username, B.zipcode
+		from
+			shopee_order_details_db__order_details_tab A 
+		left join
+			shopee_order_details_db__order_details_tab_extinfo_buyer_address B
+		on A.orderid = B.parent_key
+		left join 
+			shopee_order_details_db__order_details_tab_extinfo_seller_address C
+		on A.orderid = C.parent_key
+		left join 
+			shopee_order_details_db__order_details_tab_extinfo_logistics_info D
+		on A.orderid = D.parent_key
+		left join 
+			user_profile E
+		on A.shopid = E.shopid
+		Group by 1,2,3,4,5,6,7,8,9,10,11,12
+	),
+/* collect all descriptive details of orders*/
+
+slstable as (
+    SELECT deliver_country as country, RE.ordersn,TR.update_time as ctime, TR.channel_status
+      FROM shopee_sls_logistic_db__logistic_tracking_tab TR
+      LEFT JOIN shopee_sls_logistic_db__logistic_request_tab RE
+      ON TR.log_id = RE.log_id
+      WHERE deliver_country = 'VN'
+      GROUP BY 1,2,3,4),
+--
+betable as (
+    SELECT OD.orderid,OD.ordersn,LL.logid,LL.status,LL.channel_status,EXT.channelid,OD.grass_region,ctime
+      from
+        shopee_order_details_db__order_details_tab OD
+      LEFT JOIN
+          shopee_order_details_db__order_details_tab_extinfo_logistics_info EXT
+      ON OD.orderid = EXT.parent_key AND OD.grass_region = EXT.grass_region
+      LEFT JOIN
+          shopee_logistic_vn_db__logistic_log_v2_tab LL
+      ON EXT.logisticsid = LL.logid 
+      where LL.ctime> unix_timestamp('2018-01-01 00:00:00') AND EXT.channelid in (50066,50017)),
+-- change channelid for sls channels
+slsbe as (
+  SELECT country,logid,orderid as parent_key,slstable.ctime,slstable.channel_status as sls_status,betable.channelid
+  FROM betable INNER JOIN slstable
+  ON betable.ordersn = slstable.ordersn AND betable.grass_region = slstable.country AND betable.ctime = slstable.ctime
+  --remember join ctimes
+  GROUP BY 1,2,3,4,5,6
+),
+-- notice! channelid
+fmsot as (
+	SELECT 'IDR' as country, logisticsid as logid, on_hold_reason
+	FROM shopee_order_details_db__order_details_tab_extinfo_logistics_info EXT
+	LEFT JOIN shopee_order_details_db__order_details_tab OD 
+	ON EXT.parent_key = OD.orderid
+	INNER JOIN shopee_bi_fms_hourly_fleet_order_tab FMSFO
+	ON OD.ordersn = FMSFO.shopee_order_sn
+	WHERE shipping_carrier like 'Shopee Express' AND shipping_method in (10008,80066) AND FMSFO.on_hold_reason in (0,1,2,3,4,5,11,12)
+),
+
+id as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, NULL as channelid from
+		(
+			Select
+				('IDR') as country, A.logid,  from_unixtime(min(A.ctime)-60*60,'yyyy-MM-dd HH:mm:ss') as delivery_time
+			from
+				shopee_logistic_id_db__logistic_log_v2_tab A
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+			on A.logid = C.logisticsid
+			where (A.status = 8) and C.channelid in (80003,80004,80005,80011,80012,80013,80014)
+			group by 1,2 having min(A.ctime)-60*60 between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date) -3600 
+		) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime)-60*60,'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_id_db__logistic_log_v2_tab B
+			Where B.status = 6
+			group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5
+	),
+
+/* for ID: collect delivered orders 1 week before based on delivery done timing*/ 
+
+id1 as
+	(
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - (unix_timestamp(DATE(from_unixtime(pickup_time)))))/60/60/24 as date_difference, NULL as channelid from
+			(
+				Select
+					('IDR') as country, C.logisticsid as logid, C.parent_key, min(FMS.ctime)-3600 as delivery_time
+				from
+					shopee_fms_db__order_tracking_tab_hourly FMS
+				left join
+					shopee_order_details_db__order_details_tab OD
+				on OD.shipping_traceno = FMS.shipment_id
+				left join
+					shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+				on OD.orderid = C.parent_key
+				left join
+					shopee_order_details_db__order_details_tab_extinfo_buyer_address D
+				on C.parent_key = D.parent_key
+				where (FMS.status in (4,5)) and C.channelid = 80066 AND D.city in ('KOTA TANGERANG','KOTA TANGERANG SELATAN','KAB. TANGERANG','KAB. KEPULAUAN SERIBU','KOTA JAKARTA BARAT','KOTA JAKARTA PUSAT','KOTA JAKARTA SELATAN','KOTA JAKARTA TIMUR','KOTA JAKARTA UTARA','KAB. BEKASI','KOTA BEKASI','KAB. BOGOR','KOTA BOGOR','KOTA DEPOK')
+				and FMS.on_hold_reason in (0,1,2,3,4,5,11,12)
+				group by 1,2,3 having min(FMS.ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date) -3600 
+			) A
+-- this part is ok
+			left join
+			(
+				Select
+					B.orderid, min(B.ctime)-3600 as pickup_time	
+				from
+					shopee_order_audit_db__order_audit_v2_tab B
+				left join
+					shopee_order_details_db__order_details_tab_extinfo D
+				on B.orderid = D.parent_key AND B.grass_region = D.grass_region
+				Where B.new_status = 1 AND B.grass_region = 'ID'
+				group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 0 and 14
+			) B
+			on
+			A.parent_key = B.orderid
+			WHERE pickup_time IS NOT NULL
+			group by 1,2,3,4,5
+			union
+			Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - (unix_timestamp(DATE(from_unixtime(pickup_time)))+15*60*60))/60/60/24 as date_difference, NULL as channelid from
+			(
+				Select
+					('IDR') as country, C.logisticsid as logid, C.parent_key, min(FMS.ctime)-3600 as delivery_time
+				from
+					shopee_fms_db__order_tracking_tab_hourly FMS
+				left join
+					shopee_order_details_db__order_details_tab OD
+				on OD.shipping_traceno = FMS.shipment_id
+				left join
+					shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+				on OD.orderid = C.parent_key
+				left join
+					shopee_order_details_db__order_details_tab_extinfo_buyer_address D
+				on C.parent_key = D.parent_key
+				where (FMS.status in (4,5)) and C.channelid = 80066 AND D.city in ('KOTA TANGERANG','KOTA TANGERANG SELATAN','KAB. TANGERANG','KAB. KEPULAUAN SERIBU','KOTA JAKARTA BARAT','KOTA JAKARTA PUSAT','KOTA JAKARTA SELATAN','KOTA JAKARTA TIMUR','KOTA JAKARTA UTARA','KAB. BEKASI','KOTA BEKASI','KAB. BOGOR','KOTA BOGOR','KOTA DEPOK')
+				and FMS.on_hold_reason in (0,1,2,3,4,5,11,12)
+				group by 1,2,3 having min(FMS.ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date) -3600 
+			) A
+			left join
+			(
+				Select
+					B.orderid, min(B.ctime)-3600 as pickup_time	
+				from
+					shopee_order_audit_db__order_audit_v2_tab B
+				left join
+					shopee_order_details_db__order_details_tab_extinfo D
+				on B.orderid = D.parent_key AND B.grass_region = D.grass_region
+				Where B.new_status = 2 AND B.grass_region = 'ID'
+				group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 15 and 23
+			) B
+			on
+			A.parent_key = B.orderid
+			WHERE pickup_time IS NOT NULL
+			group by 1,2,3,4,5
+	),
+-- for ID 5 hours rule region Shopee Express
+id2 as
+	(
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - pickup_time)/60/60/24 as date_difference, NULL as channelid from
+		(
+			Select
+				('IDR') as country, A.logid, C.parent_key, min(A.ctime)-3600 as delivery_time
+			from
+				shopee_logistic_id_db__logistic_log_v2_tab A
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+			on A.logid = C.logisticsid
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_buyer_address D
+			on C.parent_key = D.parent_key
+			where (A.status in (6)) and C.channelid in (80066) AND D.city not in ('KOTA TANGERANG','KOTA TANGERANG SELATAN','KAB. TANGERANG','KAB. KEPULAUAN SERIBU','KOTA JAKARTA BARAT','KOTA JAKARTA PUSAT','KOTA JAKARTA SELATAN','KOTA JAKARTA TIMUR','KOTA JAKARTA UTARA','KAB. BEKASI','KOTA BEKASI','KAB. BOGOR','KOTA BOGOR','KOTA DEPOK')
+			group by 1,2,3 having min(A.ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date) -3600 
+		) A
+		left join
+		(
+			Select
+				B.orderid, min(B.ctime)-3600 as pickup_time	
+			from
+				shopee_logistics_audit_db__logistics_audit_tab B
+			left join
+				shopee_order_details_db__order_details_tab_extinfo D
+			on B.orderid = D.parent_key AND B.grass_region = D.grass_region
+			Where B.new_status = 9 AND B.grass_region = 'ID'
+			group by B.orderid
+		) B
+		on
+		A.parent_key = B.orderid
+		WHERE pickup_time IS NOT NULL
+		group by 1,2,3,4,5
+	),
+-- for other regions of SPX, set pick up as end(threshold 24 hours) and logistic ready(non-COD order paid OR COD confirmed)
+vn as
+	(
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - (unix_timestamp(DATE(from_unixtime(pickup_time)))+7*60*60))/60/60/24 as date_difference, NULL as channelid from
+		(
+			Select
+				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
+			from
+			(
+				(select ('VND') as country, A.logid, C.parent_key, ctime 
+					from
+						shopee_logistic_vn_db__logistic_log_v2_tab A
+					left join
+						shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+					on A.logid = C.logisticsid
+					where (A.channel_status in ('DELIVERY_PENDING','DOMESTIC_DELIVERED','DOMESTIC_DELIVERING')) and C.channelid in (50066))
+				union
+				(select country,logid,parent_key, ctime 
+					from slsbe
+					where sls_status in ('10','45','49','410','5','9') and channelid = 50066)
+			)
+			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
+		) A
+		left join
+		(
+			Select
+				B.orderid, min(B.ctime)-3600 as pickup_time	
+			from
+				shopee_order_audit_db__order_audit_v2_tab B
+			left join
+				shopee_order_details_db__order_details_tab_extinfo D
+			on B.orderid = D.parent_key AND B.grass_region = D.grass_region
+			Where B.new_status = 1 AND B.grass_region = 'VN'
+			group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 0 and 6
+		) B
+		on
+		A.parent_key = B.orderid
+		WHERE pickup_time IS NOT NULL
+		group by 1,2,3,4,5
+
+		union
+		
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - pickup_time)/60/60/24 as date_difference, NULL as channelid from
+		(
+			Select
+				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
+			from
+			(
+				(select ('VND') as country, A.logid, C.parent_key, ctime 
+					from
+						shopee_logistic_vn_db__logistic_log_v2_tab A
+					left join
+						shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+					on A.logid = C.logisticsid
+					where (A.channel_status in ('DELIVERY_PENDING','DOMESTIC_DELIVERED','DOMESTIC_DELIVERING')) and C.channelid in (50066))
+				union
+				(select country,logid,parent_key, ctime 
+					from slsbe
+					where sls_status in ('10','45','49','410','5','9') and channelid = 50066)
+			)
+			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
+		) A
+		left join
+		(
+			Select
+				B.orderid, min(B.ctime)-3600 as pickup_time	
+			from
+				shopee_order_audit_db__order_audit_v2_tab B
+			left join
+				shopee_order_details_db__order_details_tab_extinfo D
+			on B.orderid = D.parent_key AND B.grass_region = D.grass_region
+			Where B.new_status = 1 AND B.grass_region = 'VN'
+			group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 7 and 12
+		) B
+		on
+		A.parent_key = B.orderid
+		WHERE pickup_time IS NOT NULL
+		group by 1,2,3,4,5
+		union
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - (unix_timestamp(DATE(from_unixtime(pickup_time)))+31*60*60))/60/60/24 as date_difference, NULL as channelid from
+		(
+			Select
+				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
+			from
+			(
+				(select ('VND') as country, A.logid, C.parent_key, ctime 
+					from
+						shopee_logistic_vn_db__logistic_log_v2_tab A
+					left join
+						shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+					on A.logid = C.logisticsid
+					where (A.channel_status in ('DELIVERY_PENDING','DOMESTIC_DELIVERED','DOMESTIC_DELIVERING')) and C.channelid in (50066))
+				union
+				(select country,logid,parent_key, ctime 
+					from slsbe
+					where sls_status in ('10','45','49','410','5','9') and channelid = 50066)
+			)
+			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
+		) A
+		left join
+		(
+			Select
+				B.orderid, min(B.ctime)-3600 as pickup_time	
+			from
+				shopee_order_audit_db__order_audit_v2_tab B
+			left join
+				shopee_order_details_db__order_details_tab_extinfo D
+			on B.orderid = D.parent_key AND B.grass_region = D.grass_region
+			Where B.new_status = 1 AND B.grass_region = 'VN'
+			group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 13 and 23
+		) B
+		on
+		A.parent_key = B.orderid
+		WHERE pickup_time IS NOT NULL
+		group by 1,2,3,4,5
+),
+/* for VN: VN 4H timing orders 1 week before based on delivery attempt timing*/ 
+
+vn1 as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, NULL as channelid from
+		(
+			Select
+				('VND') as country, A.logid, from_unixtime(min(A.ctime),'yyyy-MM-dd HH:mm:ss') as delivery_time
+			from
+				shopee_logistic_vn_db__logistic_log_v2_tab A
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+			on A.logid = C.logisticsid
+			where (A.status = 7 or A.status = 8) and C.channelid in (50010,50011,50012,50015,50016,50018)
+			group by 1,2 having (min(A.ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date()) -3600) 
+		) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime),'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_vn_db__logistic_log_v2_tab B
+			Where B.status = 6 group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5
+),
+/* for VN: delivery timing orders 1 week before based on delivery attempt timing*/ 
+vn2 as
+	(
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - pickup_time)/60/60/24 as date_difference, NULL as channelid from
+		(
+			Select
+				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
+			from
+			(
+				(select ('VND') as country, A.logid, C.parent_key, ctime 
+					from
+						shopee_logistic_vn_db__logistic_log_v2_tab A
+					left join
+						shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+					on A.logid = C.logisticsid
+					where (A.channel_status in ('DELIVERY_PENDING','DOMESTIC_DELIVERED','DOMESTIC_DELIVERING')) and C.channelid in (50017))
+				union
+				(select country,logid,parent_key, ctime 
+					from slsbe
+					where sls_status in ('10','45','49','410','5','9') and channelid = 50017)
+			)
+			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
+		) A
+		left join
+		(
+			Select
+				B.orderid, min(B.ctime)-3600 as pickup_time	
+			from
+				shopee_order_audit_db__order_audit_v2_tab B
+			left join
+				shopee_order_details_db__order_details_tab_extinfo D
+			on B.orderid = D.parent_key AND B.grass_region = D.grass_region
+			Where B.new_status = 1 AND B.grass_region = 'VN'
+			group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 0 and 10
+		) B
+		on
+		A.parent_key = B.orderid
+		WHERE pickup_time IS NOT NULL
+		group by 1,2,3,4,5
+
+		union
+		
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - (unix_timestamp(DATE(from_unixtime(pickup_time)))+11*60*60))/60/60/24 as date_difference, NULL as channelid from
+		(
+			Select
+				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
+			from
+			(
+				(select ('VND') as country, A.logid, C.parent_key, ctime 
+					from
+						shopee_logistic_vn_db__logistic_log_v2_tab A
+					left join
+						shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+					on A.logid = C.logisticsid
+					where (A.channel_status in ('DELIVERY_PENDING','DOMESTIC_DELIVERED','DOMESTIC_DELIVERING')) and C.channelid in (50017))
+				union
+				(select country,logid,parent_key, ctime 
+					from slsbe
+					where sls_status in ('10','45','49','410','5','9') and channelid = 50017)
+			)
+			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
+		) A
+		left join
+		(
+			Select
+				B.orderid, min(B.ctime)-3600 as pickup_time	
+			from
+				shopee_order_audit_db__order_audit_v2_tab B
+			left join
+				shopee_order_details_db__order_details_tab_extinfo D
+			on B.orderid = D.parent_key AND B.grass_region = D.grass_region
+			Where B.new_status = 1 AND B.grass_region = 'VN'
+			group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 11 and 17
+		) B
+		on
+		A.parent_key = B.orderid
+		WHERE pickup_time IS NOT NULL
+		group by 1,2,3,4,5
+
+		union
+		
+		Select country, A.logid, from_unixtime(pickup_time) as pickup_time, from_unixtime(delivery_time) as delivery_time, (delivery_time - (unix_timestamp(DATE(from_unixtime(pickup_time)))+18*60*60))/60/60/24 as date_difference, NULL as channelid from
+		(
+			Select
+				('VND') as country, logid, parent_key, min(ctime)-3600 as delivery_time
+			from
+			(
+				(select ('VND') as country, A.logid, C.parent_key, ctime 
+					from
+						shopee_logistic_vn_db__logistic_log_v2_tab A
+					left join
+						shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+					on A.logid = C.logisticsid
+					where (A.channel_status in ('DELIVERY_PENDING','DOMESTIC_DELIVERED','DOMESTIC_DELIVERING')) and C.channelid in (50017))
+				union
+				(select country,logid,parent_key, ctime 
+					from slsbe
+					where sls_status in ('10','45','49','410','5','9') and channelid = 50017)
+			)
+			group by 1,2,3 having min(ctime) between unix_timestamp(current_date)-24*60*60*6 -3600 and unix_timestamp(current_date)-3600 
+		) A
+		left join
+		(
+			Select
+				B.orderid, min(B.ctime)-3600 as pickup_time	
+			from
+				shopee_order_audit_db__order_audit_v2_tab B
+			left join
+				shopee_order_details_db__order_details_tab_extinfo D
+			on B.orderid = D.parent_key AND B.grass_region = D.grass_region
+			Where B.new_status = 1 AND B.grass_region = 'VN'
+			group by B.orderid HAVING hour(from_unixtime(min(B.ctime)-3600)) between 18 and 23
+		) B
+		on
+		A.parent_key = B.orderid
+		WHERE pickup_time IS NOT NULL
+		group by 1,2,3,4,5
+),
+
+ph as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, NULL as channelid from
+		(
+			Select
+				('PHP') as country, A.logid, from_unixtime(min(A.ctime),'yyyy-MM-dd HH:mm:ss') as delivery_time
+			from
+				shopee_logistic_ph_db__logistic_log_v2_tab A
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+			on A.logid = C.logisticsid
+			where (A.status = 7 or A.status = 8) and C.channelid in (40012,40013, 40014,40016)
+			group by 1,2 having (min(A.ctime) between unix_timestamp(current_date)-24*60*60*6 and unix_timestamp(current_date()))
+		) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime),'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_ph_db__logistic_log_v2_tab B
+			Where B.status = 6 group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5
+	),
+/* for PH Xpost, BAE: collect delivered orders 1 week before based on delivery attempt timing*/ 
+ph1 as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, NULL as channelid from
+		(
+			Select
+				('PHP') as country, A.logid, from_unixtime(min(A.ctime),'yyyy-MM-dd HH:mm:ss') as delivery_time
+			from
+				shopee_logistic_ph_db__logistic_log_v2_tab A
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+			on A.logid = C.logisticsid
+			where ( A.status = 8) and C.channelid in (40015,40017)
+			group by 1,2 having (min(A.ctime) between unix_timestamp(current_date)-24*60*60*6 and unix_timestamp(current_date()))
+		) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime),'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_ph_db__logistic_log_v2_tab B
+			Where B.status = 6 group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5
+	),
+/* for PH NV: collect delivered orders 1 week before based on delivery done timing*/ 
+th as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, NULL as channelid from
+		(
+			Select
+				('THB') as country, A.logid, from_unixtime(min(A.ctime)-60*60,'yyyy-MM-dd HH:mm:ss') as delivery_time
+			from
+				shopee_logistic_th_db__logistic_log_v2_tab A
+			where (A.status = 8) 
+			group by 1,2 having (min(A.ctime)-60*60 between unix_timestamp(current_date)-24*60*60*6-3600 and unix_timestamp(current_date())-3600)
+		) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime)-60*60,'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_th_db__logistic_log_v2_tab B
+			Where B.status = 6 group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5
+	),	
+/* for TH: collect delivered orders 1 week before based on delivery done timing*/ 
+
+th1 as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, case when A.channelid = 70020 then 700201 else null end as channelid from
+		(
+			Select
+				('THB') as country, A.logid, from_unixtime(min(A.ctime)-60*60,'yyyy-MM-dd HH:mm:ss') as delivery_time, C.channelid
+			from
+				shopee_logistic_th_db__logistic_log_v2_tab A
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+			on A.logid = C.logisticsid
+			where (A.channel_status in ('DOMESTIC_DELIVERED','DELIVERY_PENDING')) and C.channelid in (70020)
+			group by 1,2,4 having (min(A.ctime)-60*60 between unix_timestamp(current_date)-24*60*60*6-3600 and unix_timestamp(current_date)-3600)
+		    ) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime)-60*60,'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_th_db__logistic_log_v2_tab B
+			Where B.status = 6 group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5,6	
+	),
+
+th2 as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, case when A.channelid = 78009 then 780091 else null end as channelid from
+		(
+			Select
+				('THB') as country, A.logid, from_unixtime(min(A.ctime)-60*60,'yyyy-MM-dd HH:mm:ss') as delivery_time, C.channelid
+			from
+				shopee_logistic_th_db__logistic_log_v2_tab A
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+			on A.logid = C.logisticsid
+			where (A.status in (7,8)) and C.channelid in (78009)
+			group by 1,2,4 having (min(A.ctime)-60*60 between unix_timestamp(current_date)-24*60*60*6-3600 and unix_timestamp(current_date)-3600)
+		    ) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime)-60*60,'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_th_db__logistic_log_v2_tab B
+			Where B.status = 6 group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5,6	
+	),
+
+sg as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, NULL as channelid from
+		(
+			Select
+				('SGD') as country, A.logid, from_unixtime(min(A.ctime),'yyyy-MM-dd HH:mm:ss') as delivery_time
+			from
+				shopee_logistic_sg_db__logistic_log_v2_tab A
+			where (A.status in (7,8)) group by 1,2 having (min(A.ctime) between unix_timestamp(current_date)-24*60*60*6 and unix_timestamp(current_date()))
+		) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime),'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_sg_db__logistic_log_v2_tab B
+			Where B.status = 6 group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5
+	),
+/* for SG: collect delivered orders 1 week before based on delivery done timing*/ 
+my as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, NULL as channelid from
+		(
+			Select
+				('MYR') as country, A.logid, from_unixtime(min(A.ctime),'yyyy-MM-dd HH:mm:ss') as delivery_time
+			from
+				shopee_logistic_my_db__logistic_log_v2_tab A
+			where (A.status in (7,8)) group by 1,2 having (min(A.ctime) between unix_timestamp(current_date)-24*60*60*6 and unix_timestamp(current_date()))
+		) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime),'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_my_db__logistic_log_v2_tab B
+			Where B.status = 6 
+			and B.ctime > (unix_timestamp('2018-01-01 00:00:00'))
+			group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5
+	),		
+/* for MY: collect delivered orders 1 week before based on delivery done timing*/ 
+
+tw as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, NULL as channelid from
+		(
+			Select
+				('TWD') as country, A.logid, from_unixtime(min(A.ctime),'yyyy-MM-dd HH:mm:ss') as delivery_time
+			from
+				shopee_logistic_tw_db__logistic_log_v2_tab A
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_logistics_info C 
+			on A.logid = C.logisticsid
+			where (A.status = 7 or A.status = 8) and C.channelid in (30005, 30006, 30007)
+			group by 1,2 
+			having (min(A.ctime) between unix_timestamp(current_date)-24*60*60*6 and unix_timestamp(current_date()))
+		) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime),'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_tw_db__logistic_log_v2_tab B
+			Where B.status = 6 group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5
+	),		
+/* for TW Hi-Life, 7-11, Family Mart: collect delivered orders 1 week before based on delivery attempt timing*/ 
+tw1 as
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, NULL as channelid from
+		(
+			Select
+				('TWD') as country, A.logid, from_unixtime(min(A.ctime),'yyyy-MM-dd HH:mm:ss') as delivery_time
+			from
+				shopee_logistic_tw_db__logistic_log_v2_tab A
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+			on A.logid = C.logisticsid
+			where (A.status = 8) and C.channelid in (30001)
+			group by 1,2 
+			having (min(A.ctime) between unix_timestamp(current_date)-24*60*60*6 and unix_timestamp(current_date()))
+		) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime),'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_tw_db__logistic_log_v2_tab B
+			Where B.status = 6 group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5
+	),			
+/* for TW Heimao : collect delivered orders 1 week before based on delivery done timing*/ 
+twsls as 
+	(
+		Select country, A.logid, pickup_time, delivery_time, datediff(delivery_time,pickup_time) as date_difference, NULL as channelid from
+		(
+			Select
+				('TWD') as country, A.logid, from_unixtime(min(A.ctime),'yyyy-MM-dd HH:mm:ss') as delivery_time
+			from
+				shopee_logistic_tw_db__logistic_log_v2_tab A
+			left join
+				shopee_order_details_db__order_details_tab_extinfo_logistics_info C
+			on A.logid = C.logisticsid
+			where (A.channel_status in ('DELIVERY_PENDING','DOMESTIC_DELIVERED')) and C.channelid in (30008)
+			group by 1,2 
+			having (min(A.ctime) between unix_timestamp(current_date)-24*60*60*6 and unix_timestamp(current_date()))
+		) A
+		left join
+		(
+			Select
+				B.logid, from_unixtime(min(B.ctime),'yyyy-MM-dd HH:mm:ss') as pickup_time	
+			from
+				shopee_logistic_tw_db__logistic_log_v2_tab B
+			Where B.status = 6 group by B.logid
+		) B
+		on
+		A.logid = B.logid
+		group by 1,2,3,4,5
+	),
+/* for TW OK-Mart : SLS System, have some mimatch of logistic codes*/ 
+allcountry as 
+ 	(
+ 	select * from id 
+ 	union
+ 	select * from id1
+ 	union 
+ 	select * from id2
+ 	union 
+ 	select * from ph 
+ 	union 
+  	select * from ph1
+  	union 
+ 	select * from vn
+ 	union 
+ 	select * from vn1
+ 	union 
+ 	select * from vn2 
+ 	union 
+ 	select * from th
+  	union 
+   	select * from th1
+   	union
+   	select * from th2
+  	union 
+ 	select * from sg
+ 	union 
+ 	select * from my
+ 	union 
+ 	select * from tw
+ 	union 
+ 	select * from tw1
+ 	union 
+ 	select * from twsls
+ 	)
+Select T1.orderid, T1.shipping_traceno, T1.logisticsid, T1.currency, case when allcountry.channelid IS NOT NULL then allcountry.channelid else T1.channelid end	as channelid, T1.buyer_city, T1.buyer_state, T1.zipcode, T1.seller_city, T1.seller_state, T1.seller_username, allcountry.pickup_time, allcountry.delivery_time, allcountry.date_difference from allcountry
+left join T1 on T1.logisticsid=allcountry.logid and T1.currency = allcountry.country
+where allcountry.pickup_time != ""  and ((T1.currency = "MYR" and (T1.buyer_city not like '%"%' and T1.seller_city not like '%"%')) or T1.currency != "MYR")
+--18-09-03: added zipcode for mydhl
