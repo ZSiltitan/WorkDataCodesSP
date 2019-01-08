@@ -1,0 +1,394 @@
+WITH OD AS
+(
+SELECT OD.orderid,OD.ordersn, OD.shipping_traceno, OD.status_ext, OD.shipping_confirm_time, 'TH' AS grass_region, LL.logid, LL.arrival_time,EXT.channelid
+FROM
+	(SELECT orderid, ordersn, shipping_traceno, status_ext, shipping_confirm_time, 'TH' AS grass_region, to_date(from_unixtime(shipping_confirm_time)) AS orderdate FROM
+	shopee_order_details_th_db__order_details_tab
+	WHERE shipping_confirm_time > unix_timestamp('2018-08-01 00:00:00')
+	) OD
+LEFT JOIN
+    shopee_order_details_th_db__order_details_tab_extinfo_logistics_info EXT
+ON OD.orderid = EXT.parent_key
+LEFT JOIN
+    (SELECT logid, min(ctime) as arrival_time FROM
+    shopee_logistic_th_db__logistic_log_v2_tab
+    WHERE status IN (7,8) AND ctime > unix_timestamp('2018-08-01 00:00:00')
+    group by 1) LL
+ON EXT.logisticsid = LL.logid
+),
+/*Deleted the OD.status LL.status from LL because of duplicates zexi 1217*/
+FMSLATEST AS (
+	SELECT shipment_id,status as fms_status,on_hold_reason,driver_name,min(ctime) as ctime
+	FROM shopee_fms_th_db__fleet_order_tab_hourly
+	WHERE ctime > unix_timestamp('2018-08-01 00:00:00') - 86400*3
+	group by 1,2,3,4
+),
+
+WMSLATEST AS(
+	SELECT shopee_order_sn, status AS wms_status, consignment_number, ctime AS WMSctime
+	FROM shopee_wms_th_db__order_tab_hourly
+	WHERE deliver_country = 'TH' AND ctime >= unix_timestamp('2018-08-01 00:00:00')
+),
+/* Record latest wms data, overwrite history data but OK since we only need outbound time*/
+
+/* Retrieve only outbound status time, this table may be no use anymore, could just use WMSLATEST*/
+FMSOTHIST AS(
+	select shipment_id,status as fms_status,on_hold_reason,min(ctime) AS ctime
+	from shopee_fms_th_db__order_tracking_tab_hourly
+	where ctime > unix_timestamp('2018-08-01 00:00:00')
+     -- and shipment_id not in
+     --   ( select shipping_trace_no
+     --    from shopee_bi_th_hourly_order
+     --    where shipping_carrier = 'Shopee Express'
+     --      and status_be like '%order_cancel%'
+     --      and status_be like '%invalid%'
+     --    UNION select shipping_traceno
+     --    from order_mart__order_profile
+     --    where be_status in ('CANCEL_COMPLETED',
+     --                        'CANCEL_PENDING',
+     --                        'CANCEL_PROCESSING') )
+    group by 1,2,3
+)
+,
+/* Including history data, table is fast but joinext part is super slow*/
+
+TOHIST AS(
+	SELECT shipment_id,trot.status as tostatus,trot.ctime as TOcreatetime, trot.driver_scan_time as TOdriver_scan_time,trot.complete_time AS TOcomplete_time,
+	trot.receive_time AS TOreceivetime,trot.handover_time as TOhandover_time,trot.delivered_time as TOdelivered_time
+	FROM shopee_fms_th_db__fleet_order_tab_hourly flt
+	INNER JOIN shopee_fms_th_db__transport_order_detail_tab_hourly trod ON flt.shipment_id = trod.fleet_order_id
+	INNER JOIN shopee_fms_th_db__transport_order_tab_hourly trot on trod.to_number = trot.to_number
+	WHERE trot.status = 6
+),
+/*No duplication*/
+/* including all WMS status */	
+/*-------------------------------------------------raw data----------------------------------------------*/
+
+DATALATEST AS
+(SELECT
+	OD.orderid,OD.ordersn,OD.shipping_traceno,OD.logid,OD.status_ext as beodstatus,OD.grass_region,OD.arrival_time, 
+	case when date_format(from_unixtime(OD.shipping_confirm_time + 3600*3),'E') in ('Sat','Sun') then 1 else 0 end as holiday,
+	OD.shipping_confirm_time as paid_time, FMSLATEST.on_hold_reason, fms_status,FMSLATEST.ctime as fms_time,wms_status, to_date(from_unixtime(OD.arrival_time)) as arrivaldate,driver_name
+FROM
+	OD
+LEFT JOIN
+	FMSLATEST
+ON OD.shipping_traceno = FMSLATEST.shipment_id
+LEFT JOIN
+	WMSLATEST 
+ON WMSLATEST.shopee_order_sn = OD.ordersn
+where channelid = 70066 AND OD.logid is not null
+),
+/*Can run, deleted be3plstatus 1217 zexi*/
+/*judge holiday: shipping_confirm_time + 3600*3 to complete cutoff time 21:00*/
+FMSDB AS
+(SELECT
+	OD.orderid,OD.ordersn,OD.shipping_traceno,OD.logid,OD.status_ext as beodstatus,OD.grass_region,OD.arrival_time,
+	shipping_confirm_time as paid_time, FMSOTHIST.on_hold_reason, fms_status,FMSOTHIST.ctime as fms_time, to_date(from_unixtime(arrival_time)) as arrivaldate
+FROM
+	OD
+INNER JOIN
+	FMSOTHIST
+ON OD.shipping_traceno = FMSOTHIST.shipment_id
+where channelid = 70066
+),
+
+WMSDB AS
+(SELECT
+	OD.orderid,OD.ordersn,OD.shipping_traceno,OD.logid,OD.grass_region,OD.arrival_time,
+	shipping_confirm_time as paid_time, WMSctime,wms_status
+FROM
+	OD
+LEFT JOIN
+	WMSLATEST 
+ON WMSLATEST.shopee_order_sn = OD.ordersn
+where channelid = 70066
+),
+
+TODB AS
+(SELECT 
+	OD.orderid,OD.ordersn,OD.shipping_traceno,OD.logid,OD.grass_region,OD.arrival_time,	shipping_confirm_time as paid_time,tostatus,TOcreatetime,TOdriver_scan_time,TOcomplete_time,TOreceivetime,TOhandover_time,TOdelivered_time
+FROM
+	OD
+INNER JOIN
+	TOHIST 
+ON TOHIST.shipment_id = OD.shipping_traceno
+WHERE channelid = 70066
+
+),
+/*Arrial time: larger than paid day(including after cutoff time paid)*/
+/* All records, set arrival time restrction here */
+/* Remember change the channelid*/
+/*set date to trace back here*/
+/*The day before yesterday 22:00 (current_date) - 86400*2 - 3600*2 = 180000, yesterday cutoff time (current_date) - 86400*2 + 22*3600 = 93600*/
+
+/*------------------------------------------------------------------rawdata done---------------------------------------------------------------*/
+
+
+
+-- SELECT * FROM FMSDB LEFT JOIN WMSDB ON FMSDB.orderid = WMSDB.orderid AND FMSDB.ordersn = WMSDB.ordersn AND FMSDB.shipping_traceno = WMSDB.shipping_traceno AND FMSDB.logid = WMSDB.logid AND FMSDB.grass_region = WMSDB.grass_region 
+-- AND FMSDB.arrival_time = WMSDB.arrival_time AND FMSDB.paid_time = WMSDB.paid_time
+-- where WMSDB.paid_time > unix_timestamp('2018-11-28 00:00:00')
+SLATBSAMEDAY AS
+(
+	SELECT 
+	SUM(case when arrival_time between unix_timestamp(to_date(from_unixtime(paid_time))) AND unix_timestamp(to_date(from_unixtime(paid_time))) + 86400 AND fms_status = 4 THEN 1 ELSE 0 END) AS ontimesuccessSame,
+	SUM(CASE WHEN arrival_time between unix_timestamp(to_date(from_unixtime(paid_time))) AND unix_timestamp(to_date(from_unixtime(paid_time))) + 86400 AND on_hold_reason IN (1,2,3,4,5,11,12) THEN 1 ELSE 0 END) AS OnholdBuyerfaultSame,
+	SUM(CASE WHEN arrival_time between unix_timestamp(to_date(from_unixtime(paid_time))) AND unix_timestamp(to_date(from_unixtime(paid_time))) + 86400 AND on_hold_reason IN (6,7,8,9,10) THEN 1 ELSE 0 END) AS OnholdSPXfaultSame,
+	-- SUM(CASE WHEN arrival_time > unix_timestamp(to_date(from_unixtime(paid_time + 26*3600))) + 86400  AND fms_status = 4 THEN 1 ELSE 0 END) AS DeliveryLate,
+	SUM(CASE WHEN arrival_time between unix_timestamp(to_date(from_unixtime(paid_time))) AND unix_timestamp(to_date(from_unixtime(paid_time))) + 86400 AND fms_status = 2 THEN 1 ELSE 0 END) AS AssignNotUpdateSame,
+	-- SUM(CASE WHEN arrival_time between unix_timestamp(to_date(from_unixtime(paid_time))) AND unix_timestamp(to_date(from_unixtime(paid_time))) + 86400 AND wms_status <> 8 THEN 1 ELSE 0 END) AS InWarehouse,
+	-- SUM(CASE WHEN arrival_time between unix_timestamp(to_date(from_unixtime(paid_time))) AND unix_timestamp(to_date(from_unixtime(paid_time))) + 86400 AND fms_status = 1 THEN 1 ELSE 0 END) AS Unassigned,
+	'a' as index
+	FROM DATALATEST
+	WHERE paid_time between unix_timestamp(current_date) - 86400*2 - 3600*3 AND unix_timestamp(current_date) - 86400 - 3600*3 AND arrival_time >= unix_timestamp(to_date(from_unixtime(paid_time)))
+	group by 5
+),
+
+SLATB AS
+(
+	SELECT 
+	SUM(case when holiday = 0 then 
+		(case when arrival_time between unix_timestamp(to_date(from_unixtime(paid_time + 27*3600))) AND unix_timestamp(to_date(from_unixtime(paid_time + 27*3600))) + 86400 AND fms_status = 4 THEN 1 ELSE 0 END)
+		else 
+		(case when arrival_time between unix_timestamp(to_date(from_unixtime(paid_time + 27*3600))) AND unix_timestamp(to_date(from_unixtime(paid_time + 27*3600))) + 86400*2 AND fms_status = 4 THEN 1 ELSE 0 END)
+		end) AS ontimesuccess,
+	SUM(CASE WHEN on_hold_reason IN (1,2,3,4,5,11,12) THEN 1 ELSE 0 END) AS OnholdBuyerfault,
+	SUM(CASE WHEN on_hold_reason IN (6,7,8,9,10) THEN 1 ELSE 0 END) AS OnholdSPXfault,
+	SUM(case when holiday = 0 then 
+		(CASE WHEN arrival_time > unix_timestamp(to_date(from_unixtime(paid_time + 27*3600))) + 86400  AND fms_status = 4 THEN 1 ELSE 0 END)
+		else
+		(CASE WHEN arrival_time > unix_timestamp(to_date(from_unixtime(paid_time + 27*3600))) + 86400*2  AND fms_status = 4 THEN 1 ELSE 0 END)
+		end) AS DeliveryLate,
+	SUM(CASE WHEN fms_status = 2 THEN 1 ELSE 0 END) AS AssignNotUpdate,
+	SUM(CASE WHEN wms_status <> 8 THEN 1 ELSE 0 END) AS InWarehouse,
+	SUM(CASE WHEN fms_status = 1 THEN 1 ELSE 0 END) AS Unassigned,
+	'a' as index
+	FROM DATALATEST
+	WHERE paid_time between unix_timestamp(current_date) - 86400*2 - 3600*3 AND unix_timestamp(current_date) - 86400 - 3600*3 AND arrival_time >= unix_timestamp(to_date(from_unixtime(paid_time + 27*3600)))
+	group by 8
+),
+/*cannot use unix_timestamp(date_add(to_date(from_unixtime(paid_time)),2)) for late */
+/*Test ok 1217*/
+/*Use orderdate and arrivaldate as key*/
+--+27*3600 to jump the cutofftime and make the time into another whole day 24h
+/* - 3600*3 change to 9pm cutoff time*/
+/* + 86400*2 to give another day to holiday*/
+DPTB AS
+(
+	SELECT
+	SUM(CASE WHEN paid_time between	unix_timestamp(current_date) - 86400 - 3600*3 AND unix_timestamp(current_date) - 3600*3 THEN 1 ELSE 0 END) AS ToBeDeliveredToday,
+	SUM(CASE WHEN paid_time between	unix_timestamp(current_date) - 86400*2 - 3600*3 AND unix_timestamp(current_date) - 86400 - 3600*3 THEN 1 ELSE 0 END) AS ToBeDeliveredYesterdayWithinSLA,
+	SUM(CASE WHEN paid_time < unix_timestamp(current_date) - 86400*2 - 3600*3 THEN 1 ELSE 0 END) AS ToBeDeliveredMoreThan1Day,
+
+	SUM(CASE WHEN on_hold_reason = 0 AND fms_status = 4 AND paid_time between unix_timestamp(current_date) - 86400 - 3600*3 AND unix_timestamp(current_date) - 3600*3 THEN 1 ELSE 0 END) AS DeliveredTodayOrder,
+	SUM(CASE WHEN on_hold_reason = 0 AND fms_status = 4 AND paid_time between unix_timestamp(current_date) - 86400*2 - 3600*3 AND unix_timestamp(current_date) - 86400 - 3600*3 THEN 1 ELSE 0 END) AS DeliveredYesterdayWithinSLA,
+	SUM(CASE WHEN on_hold_reason = 0 AND fms_status = 4 AND paid_time < unix_timestamp(current_date) - 86400*2 - 3600*3 THEN 1 ELSE 0 END) AS DeliveredMoreThan1Day,
+
+	SUM(CASE WHEN on_hold_reason !=0 AND fms_status !=4 AND paid_time between unix_timestamp(current_date) - 86400 - 3600*3 AND unix_timestamp(current_date) - 3600*3 THEN 1 ELSE 0 END) AS NotDeliveredTodayOrder,
+	SUM(CASE WHEN on_hold_reason !=0 AND fms_status !=4 AND paid_time between unix_timestamp(current_date) - 86400*2 - 3600*3 AND unix_timestamp(current_date) - 86400 - 3600*3 THEN 1 ELSE 0 END) AS NotDeliveredYesterdayWithinSLA,
+
+	SUM(CASE WHEN on_hold_reason !=0 AND fms_status !=4 AND paid_time < unix_timestamp(current_date) - 86400*2 - 3600*3 THEN 1 ELSE 0 END) AS NotDeliveredMoreThan1Day,
+	count(distinct driver_name) AS ActiveDrivers,
+	'a' as index
+	FROM DATALATEST
+-- WHERE arrival_time between unix_timestamp(date_add(current_date,-1)) AND unix_timestamp(current_date) AND arrival_time is not null
+	WHERE arrival_time between unix_timestamp(current_date) - 86400 AND unix_timestamp(current_date) AND arrival_time is not null
+	group by 11
+),
+/*Test ok 1217*/
+WHDCTB AS
+(
+	SELECT
+	SUM(CASE WHEN fms_status = 7 AND fms_time between unix_timestamp(current_date) - 86400 AND unix_timestamp(current_date) - 3600*2 THEN 1 ELSE 0 END) AS DCinbound,
+	SUM(CASE WHEN fms_status = 8 AND fms_time between unix_timestamp(current_date) - 86400 AND unix_timestamp(current_date) - 3600*2 THEN 1 ELSE 0 END) AS DCoutbound,
+	SUM(CASE WHEN fms_status = 9 AND fms_time between unix_timestamp(current_date) - 86400 AND unix_timestamp(current_date) - 3600*2 THEN 1 ELSE 0 END) AS DClinehaul,
+	'a' as index
+	FROM FMSDB
+	WHERE fms_time > unix_timestamp(current_date) - 86400 - 3600
+	group by 4
+),
+
+WHDCTB2 AS
+(
+	SELECT
+	SUM(CASE WHEN fms_status = 5 AND fms_time between unix_timestamp(current_date) - 86400 AND unix_timestamp(current_date) - 3600*2 THEN 1 ELSE 0 END) AS AttempTimes,
+--ADJUST THIS ONE
+	SUM(CASE WHEN fms_status = 4 AND fms_time between unix_timestamp(current_date) - 86400 AND unix_timestamp(current_date) - 3600*2 THEN 1 ELSE 0 END) AS Success,
+	'a' as index
+	FROM FMSDB
+	WHERE fms_time > unix_timestamp(current_date) - 86400 - 3600
+	group by 3
+),
+
+/*Duration: Average Process Times*/
+DURATAB AS
+(
+	SELECT
+	avg((FMSDB.arrival_time - FMSDB.paid_time)/60/60/24) AS TotalDuration,
+	percentile(cast((FMSDB.arrival_time - FMSDB.paid_time)/60/60/24 as bigint),0.5) AS TotalDuration_pctl_50,
+	percentile(cast((FMSDB.arrival_time - FMSDB.paid_time)/60/60/24 as bigint),0.9) AS TotalDuration_pctl_90,
+	avg((WMSctime - WMSDB.paid_time)/60/60/24) AS PaidtoWH,
+	percentile(cast((WMSctime - WMSDB.paid_time)/60/60/24 as bigint),0.5) AS PaidtoWH_pctl_50,
+	percentile(cast((WMSctime - WMSDB.paid_time)/60/60/24 as bigint),0.9) AS PaidtoWH_pctl_90,
+	avg((CASE when fms_status = 8 THEN FMSDB.fms_time - WMSctime ELSE NULL END)/60/60/24) AS WHtoDCin,
+	percentile(cast((CASE when fms_status = 8 THEN FMSDB.fms_time - WMSctime ELSE NULL END)/60/60/24 as bigint),0.5) AS WHtoDCin_pctl_50,
+	percentile(cast((CASE when fms_status = 8 THEN FMSDB.fms_time - WMSctime ELSE NULL END)/60/60/24 as bigint),0.9) AS WHtoDCin_pctl_90,
+	avg((CASE when fms_status = 8 THEN TODB.TOcreatetime - FMSDB.fms_time ELSE NULL END)/60/60/24) AS DCintoTO,
+	percentile(cast((CASE when fms_status = 8 THEN TODB.TOcreatetime - FMSDB.fms_time ELSE NULL END)/60/60/24 as bigint),0.5) AS DCintoTO_pctl_50,
+	percentile(cast((CASE when fms_status = 8 THEN TODB.TOcreatetime - FMSDB.fms_time ELSE NULL END)/60/60/24 as bigint),0.9) AS DCintoTO_pctl_90,
+	avg((TODB.TOcomplete_time - TOcreatetime)/60/60/24) AS TOtoOut,
+	percentile(cast((TODB.TOcomplete_time - TOcreatetime)/60/60/24 as bigint),0.5) AS TOtoOut_pctl_50,
+	percentile(cast((TODB.TOcomplete_time - TOcreatetime)/60/60/24 as bigint),0.9) AS TOtoOut_pctl_90,
+	avg((TODB.TOdriver_scan_time - TOcomplete_time)/60/60/24) AS DCtoHub,
+	percentile(cast((TODB.TOdriver_scan_time - TOcomplete_time)/60/60/24 as bigint),0.5) AS DCtoHub_pctl_50,
+	percentile(cast((TODB.TOdriver_scan_time - TOcomplete_time)/60/60/24 as bigint),0.9) AS DCtoHub_pctl_90,
+	avg((CASE when fms_status = 2 THEN FMSDB.fms_time - TODB.TOdriver_scan_time ELSE NULL END)/60/60/24) AS ScantoPick,
+	percentile(cast((CASE when fms_status = 2 THEN FMSDB.fms_time - TODB.TOdriver_scan_time ELSE NULL END)/60/60/24 as bigint),0.5) AS ScantoPick_pctl_50,
+	percentile(cast((CASE when fms_status = 2 THEN FMSDB.fms_time - TODB.TOdriver_scan_time ELSE NULL END)/60/60/24 as bigint),0.9) AS ScantoPickb_pctl_90,
+	avg(((CASE WHEN fms_status = 2 THEN FMSDB.arrival_time - FMSDB.fms_time ELSE NULL END))/60/60/24) AS PicktoDeliver,
+	percentile(cast((CASE WHEN fms_status = 2 THEN FMSDB.arrival_time - FMSDB.fms_time ELSE NULL END)/60/60/24 as bigint),0.5) AS PicktoDeliver_pctl_50,
+	percentile(cast((CASE WHEN fms_status = 2 THEN FMSDB.arrival_time - FMSDB.fms_time ELSE NULL END)/60/60/24 as bigint),0.9) AS PicktoDeliver_pctl_90,
+	-- avg((CASE WHEN((CASE WHEN fms_status = 2 THEN FMSDB.fms_time ELSE NULL END) - (CASE WHEN fms_status = 5 THEN FMSDB.fms_time ELSE NULL END)) > 0 THEN 
+	-- 	((CASE WHEN fms_status = 2 THEN FMSDB.fms_time ELSE NULL END) - (CASE WHEN fms_status = 5 THEN FMSDB.fms_time ELSE NULL END)) ELSE NULL END)/60/60 ) AS RePick,
+/*4,5 may got some issue*/
+/*(CASE when fms_status in (4,5) THEN FMSDB.fms_time ELSE NULL END)*/
+	'a' as index
+	FROM FMSDB LEFT JOIN WMSDB ON FMSDB.orderid = WMSDB.orderid
+	LEFT JOIN TODB ON FMSDB.orderid = TODB.orderid
+	WHERE FMSDB.arrival_time <> 0 AND FMSDB.paid_time <> 0 AND WMSctime <> 0 
+	-- AND TODB.TOcreatetime <> 0 AND TODB.TOcomplete_time <> 0 AND TODB.TOdriver_scan_time <> 0 --zzx 1222 table error
+	group by 25
+),
+
+DURATAB2 AS
+(
+	SELECT avg(a.fms_time - b.fms_time) AS Repick,
+	percentile(cast((a.fms_time - b.fms_time) as bigint),0.5) AS Repick_percentile_50,
+	percentile(cast((a.fms_time - b.fms_time) as bigint),0.9) AS Repick_percentile_90,
+	'a' as index
+	FROM
+	(SELECT orderid,fms_status,fms_time
+		from FMSDB
+		WHERE fms_status = 2) a
+	INNER JOIN (
+		SELECT orderid,fms_status,fms_time
+		from FMSDB
+		WHERE fms_status = 5) b ON a.orderid = b.orderid
+	where a.fms_time > b.fms_time
+	group by 4
+
+),
+
+TIMETAB AS
+(
+	SELECT date_add(current_date,-1) as currentdate,
+	'a' as index
+),
+
+EMPTY1 AS
+(
+	SELECT 'a' as index
+),
+
+EMPTY2 AS
+(
+	SELECT 'a' as index
+),
+
+EMPTY3 AS
+(
+	SELECT 'a' as index
+),
+
+EMPTY4 AS
+(
+	SELECT 'a' as index
+),
+
+EMPTY5 AS
+(
+	SELECT 'a' as index
+)
+
+
+SELECT 
+-- SLATB.orderdate,
+-- SLATB.arrivaldate,
+currentdate,
+
+ontimesuccessSame,
+OnholdBuyerfaultSame,
+OnholdSPXfaultSame,
+AssignNotUpdateSame,
+
+ontimesuccess,
+OnholdBuyerfault,
+DeliveryLate,
+AssignNotUpdate,
+InWarehouse,
+Unassigned,
+OnholdSPXfault,
+
+DCinbound,
+DCoutbound,
+DClinehaul,
+--
+CASE WHEN DCoutbound <> 0 then AttempTimes/DCoutbound else 0 END AS AttemptRate,
+CASE WHEN DCoutbound <> 0 then Success/DCoutbound else 0 END AS SuccessRate,
+
+ToBeDeliveredToday,
+ToBeDeliveredYesterdayWithinSLA,
+ToBeDeliveredMoreThan1Day,
+
+DeliveredTodayOrder,
+DeliveredYesterdayWithinSLA,
+DeliveredMoreThan1Day,
+
+NotDeliveredTodayOrder,
+NotDeliveredYesterdayWithinSLA,
+NotDeliveredMoreThan1Day,
+
+TotalDuration,
+TotalDuration_pctl_50,
+TotalDuration_pctl_90,
+PaidtoWH,
+PaidtoWH_pctl_50,
+PaidtoWH_pctl_90,
+WHtoDCin,
+WHtoDCin_pctl_50,
+WHtoDCin_pctl_90,
+DCintoTO,
+DCintoTO_pctl_50,
+DCintoTO_pctl_90,
+TOtoOut,
+TOtoOut_pctl_50,
+TOtoOut_pctl_90,
+DCtoHub,
+DCtoHub_pctl_50,
+DCtoHub_pctl_90,
+ScantoPick,
+ScantoPick_pctl_50,
+ScantoPickb_pctl_90,
+PicktoDeliver,
+PicktoDeliver_pctl_50,
+PicktoDeliver_pctl_90,
+
+ActiveDrivers,
+CASE WHEN ActiveDrivers <> 0 THEN ToBeDeliveredToday/ActiveDrivers ELSE 0 END AS AverageOrderDriver
+
+FROM TIMETAB
+LEFT JOIN SLATB ON TIMETAB.index = SLATB.index
+LEFT JOIN EMPTY1 ON SLATB.index = EMPTY1.index
+LEFT JOIN SLATBSAMEDAY 
+ON EMPTY1.index = SLATBSAMEDAY.index 
+LEFT JOIN EMPTY2 ON SLATBSAMEDAY.index = EMPTY2.index
+LEFT JOIN DPTB
+ON EMPTY2.index = DPTB.index
+LEFT JOIN EMPTY3 ON DPTB.index = EMPTY3.index
+LEFT JOIN WHDCTB ON EMPTY3.index = WHDCTB.index
+LEFT JOIN EMPTY4 ON WHDCTB.index = EMPTY4.index
+LEFT JOIN WHDCTB2 ON EMPTY4.index = WHDCTB2.index
+LEFT JOIN EMPTY5 ON WHDCTB2.index = EMPTY5.index
+LEFT JOIN DURATAB 
+ON EMPTY5.index = DURATAB.index
